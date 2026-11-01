@@ -1,4 +1,4 @@
-"""Простой Discord-бот — проверка, что всё работает."""
+"""Простой Discord-бот для майнкрафт-сервера — slash-команды."""
 
 import os
 import random
@@ -6,6 +6,7 @@ from urllib.parse import quote
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 from mcstatus import JavaServer
@@ -13,9 +14,38 @@ from mcstatus import JavaServer
 load_dotenv()
 
 intents = discord.Intents.default()
-intents.message_content = True  # включить на портале разработчика!
+intents.message_content = True  # нужен для чтения упоминаний бота
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)  # префикс не используется
+
+SYSTEM_PROMPT = (
+    "Ты — полезный ассистент Discord-бота майнкрафт-сервера. "
+    "Отвечай кратко, по делу, с лёгким юмором."
+)
+
+
+# ---------- нейронка ----------
+
+async def ask_openrouter(key: str, question: str) -> str:
+    """Спросить OpenRouter (бесплатные модели, ключ OPEN_ROUTER)."""
+    async with (
+        aiohttp.ClientSession() as session,
+        session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": question},
+                ],
+            },
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp,
+    ):
+        resp.raise_for_status()
+        data = await resp.json()
+        return data["choices"][0]["message"]["content"].strip()
 
 
 async def ask_pollinations(question: str) -> str:
@@ -35,28 +65,6 @@ async def ask_pollinations(question: str) -> str:
     raise last_error
 
 
-async def ask_openrouter(key: str, question: str) -> str:
-    """Спросить OpenRouter (бесплатные модели, ключ OPEN_ROUTER)."""
-    async with (
-        aiohttp.ClientSession() as session,
-        session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={
-                "model": os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"),
-                "messages": [
-                    {"role": "system", "content": "Ты — полезный ассистент Discord-бота майнкрафт-сервера. Отвечай кратко, по делу, с лёгким юмором."},
-                    {"role": "user", "content": question},
-                ],
-            },
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as resp,
-    ):
-        resp.raise_for_status()
-        data = await resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-
-
 async def ask_ai(question: str) -> str:
     """Сначала OpenRouter (ключ OPEN_ROUTER), иначе бесплатный Pollinations."""
     key = os.getenv("OPEN_ROUTER", "").strip()
@@ -68,24 +76,23 @@ async def ask_ai(question: str) -> str:
     return await ask_pollinations(question)  # последний шанс — бесплатный сервис
 
 
+# ---------- события ----------
+
 @bot.event
 async def on_ready():
+    # регистрация slash-команд на каждом сервере — работает мгновенно
+    for guild in bot.guilds:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
     print(f"✅ Бот запущен: {bot.user} (id={bot.user.id})")
 
 
-@bot.command()
-async def ping(ctx):
-    """Проверка задержки."""
-    await ctx.send(f"Pong! {round(bot.latency * 1000)} мс")
-
-
 @bot.event
-async def on_message(message):
-    """Отвечать на упоминания бота."""
+async def on_message(message: discord.Message):
+    """Упомянули с текстом — отвечает нейронка; пустой пинг — посылает."""
     if message.author == bot.user:
         return
-    if bot.user.mentioned_in(message):
-        # текст без самого упоминания
+    if bot.user and bot.user.mentioned_in(message):
         text = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
         if text:  # задали вопрос — отвечает нейронка
             async with message.channel.typing():
@@ -97,44 +104,48 @@ async def on_message(message):
         else:  # просто пинг — посылает
             await message.reply("Пошёл нахуй")
         return
-    await bot.process_commands(message)
+    # префиксных команд нет — process_commands не нужен
 
 
-@bot.command()
-async def hello(ctx):
-    """Поприветствовать бота."""
-    await ctx.send(f"Привет, {ctx.author.mention}!")
+# ---------- slash-команды ----------
+
+@bot.tree.command(name="ping", description="Проверить задержку бота")
+async def slash_ping(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Pong! {round(bot.latency * 1000)} мс")
 
 
-@bot.command()
-async def roll(ctx, sides: int = 6):
-    """Кинуть кубик: !roll или !roll 20."""
-    if not 2 <= sides <= 1000:
-        await ctx.send("Кубик от 2 до 1000 граней!")
-        return
-    await ctx.send(f"🎲 {ctx.author.mention} выбросил(а) **{random.randint(1, sides)}** (d{sides})")
+@bot.tree.command(name="hello", description="Поприветствовать бота")
+async def slash_hello(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Привет, {interaction.user.mention}!")
 
 
-@bot.command()
-async def coin(ctx):
-    """Подбросить монетку: !coin."""
-    await ctx.send(f"🪙 {random.choice(['Орёл!', 'Решка!'])}")
+@bot.tree.command(name="roll", description="Кинуть кубик")
+@app_commands.describe(грани="Сколько граней у кубика (по умолчанию 6)")
+async def slash_roll(interaction: discord.Interaction, грани: app_commands.Range[int, 2, 1000] = 6):
+    await interaction.response.send_message(
+        f"🎲 {interaction.user.mention} выбросил(а) **{random.randint(1, грани)}** (d{грани})"
+    )
 
 
-@bot.command()
-async def choose(ctx, *, variants: str):
-    """Случайный выбор: !choose крипер, зомби, скелет."""
-    options = [o.strip() for o in variants.split(",") if o.strip()]
+@bot.tree.command(name="coin", description="Подбросить монетку")
+async def slash_coin(interaction: discord.Interaction):
+    await interaction.response.send_message(f"🪙 {random.choice(['Орёл!', 'Решка!'])}")
+
+
+@bot.tree.command(name="choose", description="Случайно выбрать из вариантов")
+@app_commands.describe(варианты="Варианты через запятую: крипер, зомби, скелет")
+async def slash_choose(interaction: discord.Interaction, варианты: str):
+    options = [o.strip() for o in варианты.split(",") if o.strip()]
     if len(options) < 2:
-        await ctx.send("Нужно минимум 2 варианта через запятую!")
+        await interaction.response.send_message("Нужно минимум 2 варианта через запятую!", ephemeral=True)
         return
-    await ctx.send(f"Я выбираю: **{random.choice(options)}**")
+    await interaction.response.send_message(f"Я выбираю: **{random.choice(options)}**")
 
 
-@bot.command()
-async def server(ctx):
-    """Статус майнкрафт-сервера: !server."""
+@bot.tree.command(name="server", description="Статус майнкрафт-сервера")
+async def slash_server(interaction: discord.Interaction):
     address = os.getenv("MC_SERVER", "localhost:25565")
+    await interaction.response.defer()
     try:
         server = await JavaServer.async_lookup(address)
         status = await server.async_status()
@@ -145,20 +156,20 @@ async def server(ctx):
         embed.add_field(name="Задержка", value=f"{round(status.latency)} мс")
         if players.sample:
             embed.add_field(name="Онлайн", value=", ".join(p.name for p in players.sample), inline=False)
-        await ctx.send(embed=embed)
+        await interaction.followup.send(embed=embed)
     except Exception:  # noqa: BLE001 — mcstatus кидает разные типы ошибок
-        await ctx.send(f"🔴 Сервер `{address}` офлайн или недоступен.")
+        await interaction.followup.send(f"🔴 Сервер `{address}` офлайн или недоступен.")
 
 
-@bot.command(name="AI", aliases=["нейро", "спроси"])
-async def ai(ctx, *, question: str):
-    """Спросить нейронку: !ai что такое редстоун?"""
-    async with ctx.typing():
-        try:
-            await ctx.reply((await ask_ai(question))[:2000])
-        except Exception as e:  # noqa: BLE001
-            print(f"⚠️ Ошибка нейронки: {type(e).__name__}: {e}")
-            await ctx.send("⚠️ Нейронка сейчас недоступна, попробуй позже.")
+@bot.tree.command(name="ai", description="Спросить нейронку")
+@app_commands.describe(вопрос="Любой вопрос, например: что такое редстоун?")
+async def slash_ai(interaction: discord.Interaction, вопрос: str):
+    await interaction.response.defer()
+    try:
+        await interaction.followup.send((await ask_ai(вопрос))[:2000])
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ Ошибка нейронки: {type(e).__name__}: {e}")
+        await interaction.followup.send("⚠️ Нейронка сейчас недоступна, попробуй позже.")
 
 
 token = os.getenv("DISCORD_TOKEN")
