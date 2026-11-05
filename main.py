@@ -177,3 +177,32 @@ if not token:
     raise SystemExit("Задай токен: скопируй .env.example в .env и вставь DISCORD_TOKEN")
 
 bot.run(token)
+
+
+from aiohttp import web
+
+async def handle_healthcheck(request):
+    return web.Response(text="Бот работает!")
+
+async def main():
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise SystemExit("Задай токен DISCORD_TOKEN в переменных окружения!")
+
+    # Запускаем мини-сервер для хостинга (чтобы Render видел, что порт открыт)
+    app_web = web.Application()
+    app_web.router.add_get("/", handle_healthcheck)
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Веб-сервер для пинга запущен на порту {port}")
+
+    # Запускаем самого Discord-бота
+    async with bot:
+        await bot.start(token)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
