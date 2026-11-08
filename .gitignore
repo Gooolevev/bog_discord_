@@ -6,3 +6,9 @@ __pycache__/
 .idea/
 .vscode/
 .zed/
+node_modules/
+.next/
+website/.env*
+!website/.env.example
+*.tsbuildinfo
+data/

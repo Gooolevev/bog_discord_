@@ -1,13 +1,19 @@
 """Автопостройка современной структуры сервера с нативными фичами Discord."""
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from bot.utils.resources import ResourceStore
+
+log = logging.getLogger(__name__)
+
 # --- Структуры данных для продвинутой конфигурации ---
+
 
 @dataclass(frozen=True)
 class RoleConfig:
@@ -51,7 +57,9 @@ class VoiceChannelConfig:
     user_limit: int = 0
     bitrate: int = 64000  # В битах (64000 = 64 kbps, 96000 = 96 kbps для музыки)
     is_afk: bool = False
-    is_stage: bool = False  # True = создаст Трибуну (StageChannel) вместо обычного войса
+    is_stage: bool = (
+        False  # True = создаст Трибуну (StageChannel) вместо обычного войса
+    )
 
 
 @dataclass(frozen=True)
@@ -220,7 +228,6 @@ SERVER_STRUCTURE = [
             ),
         ],
     ),
-
     CategoryConfig(
         name="💬 ┆ SOCIAL",
         access_mode="public",
@@ -264,7 +271,6 @@ SERVER_STRUCTURE = [
             ),
         ],
     ),
-
     CategoryConfig(
         name="🎮 ┆ GAMING",
         access_mode="public",
@@ -305,7 +311,6 @@ SERVER_STRUCTURE = [
             ),
         ],
     ),
-
     CategoryConfig(
         name="🎧 ┆ VOICE",
         access_mode="public",
@@ -319,7 +324,6 @@ SERVER_STRUCTURE = [
             VoiceChannelConfig("💤・afk", is_afk=True),
         ],
     ),
-
     CategoryConfig(
         name="🛡️ ┆ STAFF",
         access_mode="staff_only",
@@ -353,413 +357,448 @@ SERVER_STRUCTURE = [
 
 # --- Ког ---
 
-class Builder(commands.Cog):
-    """Продвинутая постройка сервера с использованием Форумов, Трибуны и прав ролей."""
 
-    def __init__(self, bot: commands.Bot) -> None:
+class Builder(commands.Cog):
+    """Создаёт структуру сервера и хранит ID принадлежащих боту объектов."""
+
+    def __init__(self, bot: commands.Bot, store: ResourceStore | None = None) -> None:
         self.bot = bot
+        self.store = store or ResourceStore()
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    async def cog_load(self) -> None:
+        await self.store.initialize()
+
+    async def _remember(self, guild_id: int, resource: discord.abc.Snowflake) -> None:
+        await self.store.add(guild_id, resource.id)
+        await asyncio.sleep(CREATE_PAUSE)
+
+    def _overwrites(
+        self, guild: discord.Guild, roles: dict[str, discord.Role], mode: str
+    ) -> dict:
+        overwrites = {}
+        if mode == "read_only":
+            overwrites[guild.default_role] = discord.PermissionOverwrite(
+                send_messages=False,
+                add_reactions=False,
+                create_public_threads=False,
+                create_private_threads=False,
+                send_messages_in_threads=False,
+                connect=False,
+            )
+            if role := roles.get(MOD_ROLE_NAME):
+                overwrites[role] = discord.PermissionOverwrite(
+                    send_messages=True,
+                    add_reactions=True,
+                    manage_messages=True,
+                )
+        elif mode == "staff_only":
+            overwrites[guild.default_role] = discord.PermissionOverwrite(
+                view_channel=False
+            )
+            for name in (MOD_ROLE_NAME, ADMIN_ROLE_NAME):
+                if role := roles.get(name):
+                    overwrites[role] = discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        connect=True,
+                        speak=True,
+                    )
+        if mode != "public" and guild.me:
+            overwrites[guild.me] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True,
+                manage_messages=True,
+            )
+        return overwrites
 
     @app_commands.command(
-        name="построй",
-        description="Создать современную структуру сервера (форумы, трибуна, стафф-зона, роли)",
+        name="построй", description="Создать роли и структуру сервера"
     )
+    @app_commands.guild_only()
     @app_commands.describe(
-        clean="Удалить старые текстовые каналы без категорий",
-        шрифт="Стиль названий каналов (обычный, нежный курсив, воздушный, sans-serif жирный курсив)",
+        clean="Удалить созданные ботом текстовые каналы, оставшиеся без категории",
+        шрифт="Стиль названий каналов",
     )
-    @app_commands.choices(шрифт=[
-        app_commands.Choice(name="Обычный", value="обычный"),
-        app_commands.Choice(name="Нежный курсив", value="нежный курсив"),
-        app_commands.Choice(name="Воздушный", value="воздушный"),
-        app_commands.Choice(name="Sans-serif жирный курсив", value="sans-serif жирный курсив"),
-    ])
+    @app_commands.choices(
+        шрифт=[
+            app_commands.Choice(name=name.capitalize(), value=name)
+            for name in CHANNEL_FONTS
+        ]
+    )
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.checks.bot_has_permissions(administrator=True)
     async def build(
         self,
         interaction: discord.Interaction,
         clean: bool = False,
         шрифт: app_commands.Choice[str] | None = None,
     ) -> None:
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("❌ Команда работает только на сервере.", ephemeral=True)
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "❌ Команда работает только на сервере.", ephemeral=True
+            )
             return
-
         await interaction.response.defer(ephemeral=True)
+        lock = self._locks.setdefault(interaction.guild.id, asyncio.Lock())
+        if lock.locked():
+            await interaction.followup.send(
+                "⏳ На сервере уже идёт постройка или сброс.", ephemeral=True
+            )
+            return
+        async with lock:
+            await self._build(interaction, шрифт.value if шрифт else "обычный", clean)
 
-        style = шрифт.value if шрифт is not None else "обычный"
-
-        created_roles = 0
-        created_categories = 0
-        created_text = 0
-        created_forums = 0
-        created_voice = 0
+    async def _build(
+        self, interaction: discord.Interaction, style: str, clean: bool
+    ) -> None:
+        guild = interaction.guild
+        assert guild is not None
+        owned = await self.store.ids(guild.id)
+        created = {
+            "🎭 Роли": 0,
+            "📁 Категории": 0,
+            "💬 Текстовые": 0,
+            "🗂️ Форумы": 0,
+            "🔊 Голосовые / Сцены": 0,
+        }
+        roles = {role.name: role for role in guild.roles}
+        channels: dict[str, discord.abc.GuildChannel] = {}
+        welcome: tuple[discord.TextChannel, TextChannelConfig] | None = None
         afk_channel = None
 
-        # Словарь для хранения ссылок на ключевые каналы (чтобы сделать кликабельную навигацию)
-        created_channels_map: dict[str, discord.abc.GuildChannel] = {}
-        welcome_channel_And_cfg: tuple[discord.TextChannel, TextChannelConfig] | None = None
-
-        # 1. Создаём роли с правами
-        for role_cfg in ROLES_CONFIG:
-            role = discord.utils.get(guild.roles, name=role_cfg.name)
-            if role is None:
-                await guild.create_role(
-                    name=role_cfg.name,
-                    color=discord.Color(role_cfg.color),
-                    hoist=role_cfg.hoist,
-                    mentionable=role_cfg.mentionable,
-                    permissions=role_cfg.permissions,
+        for cfg in ROLES_CONFIG:
+            if cfg.name not in roles:
+                role = await guild.create_role(
+                    name=cfg.name,
+                    color=discord.Color(cfg.color),
+                    hoist=cfg.hoist,
+                    mentionable=cfg.mentionable,
+                    permissions=cfg.permissions,
                     reason="Автопостройка сервера",
                 )
-                created_roles += 1
-                await asyncio.sleep(CREATE_PAUSE)
+                await self._remember(guild.id, role)
+                roles[cfg.name] = role
+                created["🎭 Роли"] += 1
 
-        mod_role = discord.utils.get(guild.roles, name=MOD_ROLE_NAME)
-        admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE_NAME)
-
-        # 2. Создаём категории и каналы
-        for cat_cfg in SERVER_STRUCTURE:
-            overwrites: dict[discord.Role | discord.Member | discord.Object, discord.PermissionOverwrite] = {}
-
-            if cat_cfg.access_mode == "read_only":
-                overwrites[guild.default_role] = discord.PermissionOverwrite(
-                    send_messages=False,
-                    add_reactions=False,
-                    create_public_threads=False,
-                    create_private_threads=False,
-                    send_messages_in_threads=False,
-                    connect=False,
-                )
-                if mod_role:
-                    overwrites[mod_role] = discord.PermissionOverwrite(
-                        send_messages=True,
-                        add_reactions=True,
-                        manage_messages=True,
-                    )
-
-            elif cat_cfg.access_mode == "staff_only":
-                # Скрываем категорию от всех
-                overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
-                # Открываем для модераторов, админов и самого бота
-                if mod_role:
-                    overwrites[mod_role] = discord.PermissionOverwrite(
-                        view_channel=True, send_messages=True, connect=True, speak=True
-                    )
-                if admin_role:
-                    overwrites[admin_role] = discord.PermissionOverwrite(
-                        view_channel=True, send_messages=True, connect=True, speak=True
-                    )
-                if guild.me:
-                    overwrites[guild.me] = discord.PermissionOverwrite(
-                        view_channel=True, send_messages=True, manage_channels=True
-                    )
-
-            category = discord.utils.get(guild.categories, name=stylize(cat_cfg.name, style))
+        for cfg in SERVER_STRUCTURE:
+            name = stylize(cfg.name, style)
+            overwrites = self._overwrites(guild, roles, cfg.access_mode)
+            category = discord.utils.get(guild.categories, name=name)
             if category is None:
                 category = await guild.create_category(
-                    name=stylize(cat_cfg.name, style),
-                    overwrites=overwrites,
-                    reason="Автопостройка сервера",
+                    name=name, overwrites=overwrites, reason="Автопостройка сервера"
                 )
-                created_categories += 1
-            elif overwrites:
-                await category.edit(overwrites=overwrites, reason="Обновление прав категории")
-
-            # 2.1 Текстовые каналы
-            for text_cfg in cat_cfg.text_channels:
-                existing_ch = discord.utils.get(category.text_channels, name=stylize(text_cfg.name, style))
-                if existing_ch is not None:
-                    created_channels_map[text_cfg.name] = existing_ch
-                    continue
-
-                # Проверяем, поддерживает ли сервер новостные каналы (нужна фича COMMUNITY)
-                use_news = text_cfg.is_news and "COMMUNITY" in guild.features
-
-                channel = await guild.create_text_channel(
-                    name=stylize(text_cfg.name, style),
-                    category=category,
-                    topic=text_cfg.topic,
-                    slowmode_delay=text_cfg.slowmode,
-                    news=use_news,
-                    reason="Автопостройка сервера",
+                await self._remember(guild.id, category)
+                created["📁 Категории"] += 1
+            elif overwrites and category.id in owned:
+                await category.edit(
+                    overwrites=category.overwrites | overwrites,
+                    reason="Обновление прав категории",
                 )
-                created_text += 1
-                created_channels_map[text_cfg.name] = channel
-                await asyncio.sleep(CREATE_PAUSE)
+            # У существующей категории могут быть дополнительные ограничения доступа.
+            channel_overwrites = category.overwrites | overwrites
 
-                # Приветственный канал отложим на конец, чтобы подставить в него живые ссылки на остальные каналы
-                if "welcome" in text_cfg.name:
-                    welcome_channel_And_cfg = (channel, text_cfg)
-                    continue
-
-                if text_cfg.first_message:
-                    await self._send_starter_embed(channel, text_cfg)
-
-            # 2.2 Форумы (ForumChannel)
-            for forum_cfg in cat_cfg.forum_channels:
-                existing_forum = discord.utils.get(category.forums, name=stylize(forum_cfg.name, style))
-                if existing_forum is not None:
-                    created_channels_map[forum_cfg.name] = existing_forum
-                    continue
-
-                layout = (
-                    discord.ForumLayoutType.gallery_view
-                    if forum_cfg.is_gallery
-                    else discord.ForumLayoutType.list_view
+            for text in cfg.text_channels:
+                channel = discord.utils.get(
+                    category.text_channels, name=stylize(text.name, style)
                 )
-                tags = [
-                    discord.ForumTag(name=t.name, emoji=t.emoji, moderated=t.moderated)
-                    for t in forum_cfg.tags
-                ]
-
-                try:
-                    forum = await guild.create_forum(
-                        name=stylize(forum_cfg.name, style),
-                        topic=forum_cfg.topic,
+                if channel is None:
+                    channel = await guild.create_text_channel(
+                        name=stylize(text.name, style),
                         category=category,
-                        default_layout=layout,
-                        default_reaction_emoji=forum_cfg.default_reaction,
-                        available_tags=tags,
+                        topic=text.topic,
+                        slowmode_delay=text.slowmode,
+                        news=text.is_news and "COMMUNITY" in guild.features,
+                        overwrites=channel_overwrites,
                         reason="Автопостройка сервера",
                     )
-                    created_forums += 1
-                    created_channels_map[forum_cfg.name] = forum
-                    await asyncio.sleep(CREATE_PAUSE)
-                except discord.HTTPException:
-                    # Если на сервере запрещены форумы, создаём аккуратный текстовый аналог
-                    fallback = await guild.create_text_channel(
-                        name=stylize(forum_cfg.name, style),
-                        category=category,
-                        topic=forum_cfg.topic,
-                        reason="Фолбэк форума при автопостройке",
-                    )
-                    created_text += 1
-                    created_channels_map[forum_cfg.name] = fallback
-                    await asyncio.sleep(CREATE_PAUSE)
+                    await self._remember(guild.id, channel)
+                    owned.add(channel.id)
+                    created["💬 Текстовые"] += 1
+                    if text.first_message and "welcome" not in text.name:
+                        await self._send_starter_embed(channel, text)
+                channels[text.name] = channel
+                if "welcome" in text.name and channel.id in owned:
+                    welcome = channel, text
 
-            # 2.3 Голосовые каналы и Трибуны (StageChannel)
-            for voice_cfg in cat_cfg.voice_channels:
-                if voice_cfg.is_stage and discord.utils.get(category.stage_channels, name=stylize(voice_cfg.name, style)) is None:
-                    try:
-                            await guild.create_stage_channel(
-                                name=stylize(voice_cfg.name, style),
-                                category=category,
-                                reason="Автопостройка сервера",
-                            )
-                            created_voice += 1
-                            continue
-                    except discord.HTTPException:
-                        pass  # Если сервер без Сообщества, создастся как обычный войс ниже
+            for forum in cfg.forum_channels:
+                name = stylize(forum.name, style)
+                channel = discord.utils.get(
+                    category.forums, name=name
+                ) or discord.utils.get(category.text_channels, name=name)
+                if channel is None:
+                    if "COMMUNITY" in guild.features:
+                        channel = await guild.create_forum(
+                            name=name,
+                            topic=forum.topic,
+                            category=category,
+                            overwrites=channel_overwrites,
+                            default_layout=discord.ForumLayoutType.gallery_view
+                            if forum.is_gallery
+                            else discord.ForumLayoutType.list_view,
+                            default_reaction_emoji=forum.default_reaction,
+                            available_tags=[
+                                discord.ForumTag(
+                                    name=t.name, emoji=t.emoji, moderated=t.moderated
+                                )
+                                for t in forum.tags
+                            ],
+                            reason="Автопостройка сервера",
+                        )
+                        created["🗂️ Форумы"] += 1
+                    else:
+                        channel = await guild.create_text_channel(
+                            name=name,
+                            category=category,
+                            topic=forum.topic,
+                            overwrites=channel_overwrites,
+                            reason="Текстовый аналог форума",
+                        )
+                        created["💬 Текстовые"] += 1
+                    await self._remember(guild.id, channel)
+                channels[forum.name] = channel
 
-                if discord.utils.get(category.voice_channels, name=stylize(voice_cfg.name, style)) is None:
-                    # Ограничиваем битрейт лимитом сервера (на случай отсутствия бустов)
-                    safe_bitrate = min(voice_cfg.bitrate, int(guild.bitrate_limit))
-                    vc = await guild.create_voice_channel(
-                        name=stylize(voice_cfg.name, style),
-                        category=category,
-                        user_limit=voice_cfg.user_limit,
-                        bitrate=safe_bitrate,
-                        reason="Автопостройка сервера",
-                    )
-                    created_voice += 1
-                    await asyncio.sleep(CREATE_PAUSE)
-                    if voice_cfg.is_afk:
-                        afk_channel = vc
+            for voice in cfg.voice_channels:
+                name = stylize(voice.name, style)
+                channel = discord.utils.get(
+                    category.stage_channels, name=name
+                ) or discord.utils.get(category.voice_channels, name=name)
+                if channel is None:
+                    if voice.is_stage and "COMMUNITY" in guild.features:
+                        channel = await guild.create_stage_channel(
+                            name=name,
+                            category=category,
+                            overwrites=channel_overwrites,
+                            reason="Автопостройка сервера",
+                        )
+                    else:
+                        channel = await guild.create_voice_channel(
+                            name=name,
+                            category=category,
+                            user_limit=voice.user_limit,
+                            bitrate=min(voice.bitrate, int(guild.bitrate_limit)),
+                            overwrites=channel_overwrites,
+                            reason="Автопостройка сервера",
+                        )
+                    await self._remember(guild.id, channel)
+                    created["🔊 Голосовые / Сцены"] += 1
+                if voice.is_afk and isinstance(channel, discord.VoiceChannel):
+                    afk_channel = channel
 
-        # 3. Отправляем отложенное сообщение в канал приветствия с живыми упоминаниями (#канал)
-        if welcome_channel_And_cfg is not None:
-            w_channel, w_cfg = welcome_channel_And_cfg
-
-            def mention_or_name(ch_name: str) -> str:
-                ch = created_channels_map.get(ch_name)
-                return ch.mention if ch else f"**#{ch_name}**"
-
-            formatted_text = w_cfg.first_message.format(
-                rules=mention_or_name("📜・rules"),
-                news=mention_or_name("📢・announcements"),
-                chat=mention_or_name("💭・chat"),
-                media=mention_or_name("📸・gallery"),
-                lfg=mention_or_name("🤝・lfg"),
+        if welcome:
+            channel, cfg = welcome
+            links = {
+                key: channels[name].mention if name in channels else f"**#{name}**"
+                for key, name in {
+                    "rules": "📜・rules",
+                    "news": "📢・news",
+                    "chat": "💭・chat",
+                    "media": "📸・media",
+                    "lfg": "🤝・lfg",
+                }.items()
+            }
+            await self._send_starter_embed(
+                channel, cfg, cfg.first_message.format(**links), refresh=True
             )
-            await self._send_starter_embed(w_channel, w_cfg, custom_description=formatted_text)
 
-        # 4. Настраиваем системные каналы самого сервера (AFK и приветствия Discord)
-        edit_kwargs = {}
+        settings = {}
         if afk_channel is not None:
-            edit_kwargs["afk_channel"] = afk_channel
-            edit_kwargs["afk_timeout"] = 900
-        if "👋・welcome" in created_channels_map:
-            edit_kwargs["system_channel"] = created_channels_map["👋・welcome"]
-            edit_kwargs["system_channel_flags"] = discord.SystemChannelFlags(
-                join_notifications=True,
-                premium_subscriptions=True,
+            settings.update(afk_channel=afk_channel, afk_timeout=900)
+        if "👋・welcome" in channels:
+            settings.update(
+                system_channel=channels["👋・welcome"],
+                system_channel_flags=discord.SystemChannelFlags(
+                    join_notifications=True,
+                    premium_subscriptions=True,
+                ),
             )
-
-        if edit_kwargs:
+        warnings = 0
+        if settings:
             try:
-                await guild.edit(**edit_kwargs, reason="Настройка системных каналов")
-            except discord.HTTPException:
-                pass
+                await guild.edit(**settings, reason="Настройка системных каналов")
+            except discord.HTTPException as error:
+                log.warning(
+                    "Системные каналы сервера %s: HTTP %s", guild.id, error.status
+                )
+                warnings += 1
 
-        # 5. Очистка старых сиротских каналов
-        deleted_channels = 0
+        deleted = 0
         if clean:
-            for ch in guild.text_channels:
-                if ch.category_id is None and ch.id != interaction.channel_id:
-                    try:
-                        await ch.delete(reason="Очистка старых каналов")
-                        deleted_channels += 1
-                        await asyncio.sleep(DELETE_PAUSE)
-                    except discord.HTTPException:
-                        pass
-
-        # 6. Итоговый отчёт
+            for channel in guild.text_channels:
+                if (
+                    channel.id in owned
+                    and channel.category_id is None
+                    and channel.id != interaction.channel_id
+                ):
+                    if await self._delete(guild.id, channel):
+                        deleted += 1
+                    else:
+                        warnings += 1
         embed = discord.Embed(
-            title="🏗️ Сервер успешно модернизирован!",
-            description=(
-                "Создана полная инфраструктура: роли с правами, форумы с тегами, "
-                "приватный раздел для стаффа и кликабельная навигация."
-            ),
-            color=discord.Color.from_rgb(88, 101, 242),  # Фирменный Discord Blurple
+            title="🏗️ Постройка завершена", color=discord.Color.blurple()
         )
-        embed.set_author(
-            name=f"{guild.name} • Архитектор",
-            icon_url=interaction.user.display_avatar.url,
-        )
-        if guild.icon:
-            embed.set_thumbnail(url=guild.icon.url)
-
-        embed.add_field(name="🎭 Роли", value=f"`+{created_roles}`", inline=True)
-        embed.add_field(name="📁 Категории", value=f"`+{created_categories}`", inline=True)
-        embed.add_field(name="💬 Текстовые", value=f"`+{created_text}`", inline=True)
-        embed.add_field(name="🗂️ Форумы", value=f"`+{created_forums}`", inline=True)
-        embed.add_field(name="🔊 Голосовые / Сцены", value=f"`+{created_voice}`", inline=True)
-        embed.add_field(
-            name="🧹 Очистка",
-            value=f"`-{deleted_channels}`" if clean else "`Выкл.`",
-            inline=True,
-        )
-        embed.set_footer(text="💡 Совет: включи «Сообщество» в настройках сервера для работы Трибуны и Анонсов")
-        embed.timestamp = discord.utils.utcnow()
-
+        for name, count in created.items():
+            embed.add_field(name=name, value=f"+{count}")
+        embed.add_field(name="🧹 Очистка", value=f"−{deleted}")
+        if warnings:
+            embed.description = (
+                f"⚠️ Не удалось выполнить операций: {warnings}. Подробности в журнале."
+            )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _send_starter_embed(
         self,
         channel: discord.TextChannel,
         cfg: TextChannelConfig,
-        custom_description: str | None = None,
+        description: str | None = None,
+        *,
+        refresh: bool = False,
     ) -> None:
-        """Вспомогательный метод для красивого оформления и закрепления первого сообщения."""
         embed = discord.Embed(
             title=cfg.first_message_title or f"#{channel.name}",
-            description=custom_description or cfg.first_message,
-            color=discord.Color.from_rgb(88, 101, 242),
+            description=description or cfg.first_message,
+            color=discord.Color.blurple(),
         )
-        if channel.guild.icon:
-            embed.set_thumbnail(url=channel.guild.icon.url)
         embed.set_footer(text=channel.guild.name)
-
-        msg = await channel.send(embed=embed)
+        if refresh:
+            async for message in channel.history(limit=20):
+                if (
+                    message.author == self.bot.user
+                    and message.embeds
+                    and message.embeds[0].title == embed.title
+                ):
+                    await message.edit(embed=embed)
+                    return
+        message = await channel.send(embed=embed)
         if cfg.pin_first_message:
             try:
-                await msg.pin(reason="Важное стартовое сообщение")
-                # Удаляем системную плашку "Бот закрепил сообщение в этом канале"
-                async for sys_msg in channel.history(limit=3):
-                    if sys_msg.type == discord.MessageType.pins_add:
-                        await sys_msg.delete()
-                        break
-            except discord.HTTPException:
-                pass
+                await message.pin(reason="Стартовое сообщение")
+            except discord.HTTPException as error:
+                log.warning(
+                    "Закрепление в канале %s: HTTP %s", channel.id, error.status
+                )
+
+    async def _delete(
+        self, guild_id: int, resource: discord.abc.GuildChannel | discord.Role
+    ) -> bool:
+        try:
+            await resource.delete(reason="Удаление объекта, созданного ботом")
+        except discord.NotFound:
+            # Объект уже удалён вручную; запись больше не нужна.
+            await self.store.remove(guild_id, resource.id)
+            return True
+        except discord.HTTPException as error:
+            log.warning(
+                "Удаление объекта %s на сервере %s: HTTP %s",
+                resource.id,
+                guild_id,
+                error.status,
+            )
+            return False
+        await self.store.remove(guild_id, resource.id)
+        await asyncio.sleep(DELETE_PAUSE)
+        return True
 
     @app_commands.command(
-        name="ресет",
-        description="Сброс сервера: удалить каналы и/или роли, созданные ботом (только админы)",
+        name="ресет", description="Удалить только объекты, созданные и учтённые ботом"
     )
+    @app_commands.guild_only()
     @app_commands.describe(
-        каналы="Удалить все каналы, форумы и категории (кроме текущего канала)",
-        роли="Удалить роли, созданные ботом при /построй",
+        каналы="Удалить созданные ботом каналы и пустые категории, кроме текущих",
+        роли="Удалить созданные ботом роли",
+        подтвердить="Подтвердить удаление; без этого параметра будет только предварительный просмотр",
     )
     @app_commands.default_permissions(administrator=True)
     @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.checks.bot_has_permissions(manage_channels=True, manage_roles=True)
     async def reset(
         self,
         interaction: discord.Interaction,
         каналы: bool = True,
         роли: bool = True,
+        подтвердить: bool = False,
     ) -> None:
         guild = interaction.guild
         if guild is None or not isinstance(interaction.channel, discord.TextChannel):
             await interaction.response.send_message(
-                "❌ Вызывай команду из текстового канала на сервере.", ephemeral=True
+                "❌ Вызывай команду из текстового канала сервера.", ephemeral=True
             )
             return
-
         if not каналы and not роли:
-            await interaction.response.send_message("❌ Оба параметра выключены.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Оба параметра выключены.", ephemeral=True
+            )
             return
-
         await interaction.response.defer(ephemeral=True)
-
-        current_channel = interaction.channel
-        deleted_channels = 0
-        deleted_categories = 0
-        deleted_roles = 0
-
-        if каналы:
-            try:
-                await guild.edit(afk_channel=None, system_channel=None)
-            except discord.HTTPException:
-                pass
-
-            for ch in list(guild.channels):
-                if ch.id == current_channel.id or isinstance(ch, discord.CategoryChannel):
+        lock = self._locks.setdefault(guild.id, asyncio.Lock())
+        if lock.locked():
+            await interaction.followup.send(
+                "⏳ На сервере уже идёт постройка или сброс.", ephemeral=True
+            )
+            return
+        async with lock:
+            owned = await self.store.ids(guild.id)
+            targets = [
+                ch
+                for ch in guild.channels
+                if каналы
+                and ch.id in owned
+                and ch.id
+                not in (
+                    interaction.channel_id,
+                    interaction.channel.category_id,
+                )
+            ]
+            role_targets = [
+                role
+                for role in guild.roles
+                if роли
+                and role.id in owned
+                and not role.is_default()
+                and not role.managed
+                and guild.me is not None
+                and role < guild.me.top_role
+            ]
+            if not подтвердить:
+                await interaction.followup.send(
+                    f"Будут удалены объекты бота: каналов/категорий — {len(targets)}, ролей — {len(role_targets)}.\n"
+                    "Категории с оставшимися каналами сохранятся. Удаление каналов и сообщений необратимо.\n"
+                    "Для выполнения повтори `/ресет` с теми же параметрами и `подтвердить: True`.\n"
+                    "Старые объекты без записи о создании ботом не удаляются.",
+                    ephemeral=True,
+                )
+                return
+            deleted: set[int] = set()
+            failed = 0
+            categories = [
+                ch for ch in targets if isinstance(ch, discord.CategoryChannel)
+            ]
+            resources = [
+                ch for ch in targets if not isinstance(ch, discord.CategoryChannel)
+            ]
+            for resource in [*resources, *role_targets]:
+                if await self._delete(guild.id, resource):
+                    deleted.add(resource.id)
+                else:
+                    failed += 1
+            preserved = 0
+            for category in categories:
+                if any(ch.id not in deleted for ch in category.channels):
+                    preserved += 1
                     continue
-                try:
-                    await ch.delete(reason="Ресет сервера")
-                    deleted_channels += 1
-                    await asyncio.sleep(DELETE_PAUSE)
-                except discord.HTTPException:
-                    pass
-
-            for cat in list(guild.categories):
-                if cat.id == current_channel.category_id:
-                    continue
-                try:
-                    await cat.delete(reason="Ресет сервера")
-                    deleted_categories += 1
-                    await asyncio.sleep(DELETE_PAUSE)
-                except discord.HTTPException:
-                    pass
-
-        if роли:
-            bot_role_names = {r.name for r in ROLES_CONFIG}
-            for role in list(guild.roles):
-                if role.is_default() or role.managed or role.is_bot_managed():
-                    continue
-                if role.name not in bot_role_names:
-                    continue
-                try:
-                    await role.delete(reason="Ресет сервера")
-                    deleted_roles += 1
-                    await asyncio.sleep(DELETE_PAUSE)
-                except discord.HTTPException:
-                    pass
-
-        embed = discord.Embed(
-            title="🧹 Ресет завершён",
-            description="Сервер очищен. Можно строить заново через `/построй`.",
-            color=discord.Color.from_rgb(231, 76, 60),
-        )
-        if каналы:
-            embed.add_field(name="💬 Каналы и Форумы", value=f"`{deleted_channels}`", inline=True)
-            embed.add_field(name="📁 Категории", value=f"`{deleted_categories}`", inline=True)
-        if роли:
-            embed.add_field(name="🎭 Роли", value=f"`{deleted_roles}`", inline=True)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
+                if await self._delete(guild.id, category):
+                    deleted.add(category.id)
+                else:
+                    failed += 1
+            await interaction.followup.send(
+                f"🧹 Удалено объектов бота: {len(deleted)}. Ошибок: {failed}. "
+                f"Сохранено непустых категорий: {preserved}.",
+                ephemeral=True,
+            )
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
@@ -767,8 +806,10 @@ class Builder(commands.Cog):
         if role is not None and role not in member.roles:
             try:
                 await member.add_roles(role, reason="Авто-роль новичка")
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as error:
+                log.warning(
+                    "Авто-роль на сервере %s: HTTP %s", member.guild.id, error.status
+                )
 
 
 async def setup(bot: commands.Bot) -> None:

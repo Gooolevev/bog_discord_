@@ -1,208 +1,200 @@
-"""Простой Discord-бот для майнкрафт-сервера — slash-команды."""
+"""Запуск бота и необязательной HTTP-проверки готовности для хостинга."""
 
+import asyncio
+import logging
 import os
-import random
-from urllib.parse import quote
 
 import aiohttp
 import discord
+from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-from mcstatus import JavaServer
 
-load_dotenv()
+from bot.dashboard import create_dashboard_app
+from bot.utils.settings import SettingsStore
 
-intents = discord.Intents.default()
-intents.message_content = True  # нужен для чтения упоминаний бота
-
-bot = commands.Bot(command_prefix="!", intents=intents)  # префикс не используется
-
-SYSTEM_PROMPT = (
-    "Ты — полезный ассистент Discord-бота майнкрафт-сервера. "
-    "Отвечай кратко, по делу, с лёгким юмором."
+log = logging.getLogger(__name__)
+COGS = (
+    "bot.cogs.general",
+    "bot.cogs.community",
+    "bot.cogs.minecraft",
+    "bot.cogs.ai",
+    "bot.cogs.builder",
+    "bot.cogs.monitor",
 )
+CONNECT_ATTEMPTS = 5
 
 
-# ---------- нейронка ----------
-
-async def ask_openrouter(key: str, question: str) -> str:
-    """Спросить OpenRouter (бесплатные модели, ключ OPEN_ROUTER)."""
-    async with (
-        aiohttp.ClientSession() as session,
-        session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={
-                "model": os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"),
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": question},
-                ],
-            },
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as resp,
-    ):
-        resp.raise_for_status()
-        data = await resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-
-
-async def ask_pollinations(question: str) -> str:
-    """Спросить бесплатную нейронку (Pollinations.ai, без ключа)."""
-    url = f"https://text.pollinations.ai/{quote(question)}"
-    last_error: Exception = RuntimeError("pollinations не ответил")
-    for _attempt in range(3):  # сервис бесплатный, бывают сбои — пробуем 3 раза
+class CommandTree(app_commands.CommandTree):
+    async def on_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        if isinstance(error, app_commands.MissingPermissions):
+            message = "❌ Недостаточно прав для этой команды."
+        elif isinstance(error, app_commands.BotMissingPermissions):
+            message = "❌ Боту не хватает прав для этой команды."
+        elif isinstance(error, app_commands.NoPrivateMessage):
+            message = "❌ Команда работает только на сервере."
+        elif isinstance(error, app_commands.CommandOnCooldown):
+            message = f"⏳ Повтори через {error.retry_after:.0f} сек."
+        else:
+            original = getattr(error, "original", error)
+            log.error("Команда %s: %s", interaction.command, type(original).__name__)
+            message = (
+                "⚠️ Не удалось выполнить команду. Операция могла завершиться частично."
+            )
         try:
-            async with (
-                aiohttp.ClientSession() as session,
-                session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp,
-            ):
-                resp.raise_for_status()
-                return (await resp.text()).strip()
-        except Exception as e:  # noqa: BLE001 — любой сбой сети повторяем
-            last_error = e
-    raise last_error
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException as send_error:
+            log.warning(
+                "Не удалось отправить ошибку команды: HTTP %s", send_error.status
+            )
 
 
-async def ask_ai(question: str) -> str:
-    """Сначала OpenRouter (ключ OPEN_ROUTER), иначе бесплатный Pollinations."""
-    key = os.getenv("OPEN_ROUTER", "").strip()
-    if key:
+class DiscordBot(commands.Bot):
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            tree_cls=CommandTree,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        self._synced_guilds: set[int] = set()
+        self.settings = SettingsStore()
+        self._dashboard_runner: web.AppRunner | None = None
+
+    async def setup_hook(self) -> None:
+        await self.settings.initialize()
+        for module in COGS:
+            await self.load_extension(module)
+            log.info("Ког загружен: %s", module)
+        if port := os.getenv("BOT_API_PORT", "").strip():
+            number = int(port)
+            if not 1 <= number <= 65535:
+                raise ValueError("BOT_API_PORT должен быть в диапазоне 1–65535")
+            app = create_dashboard_app(self, os.getenv("BOT_API_SECRET", ""))
+            self._dashboard_runner = web.AppRunner(app, access_log=None)
+            await self._dashboard_runner.setup()
+            await web.TCPSite(self._dashboard_runner, "127.0.0.1", number).start()
+            log.info("Закрытый API панели запущен на loopback:%s", number)
+
+    async def close(self) -> None:
+        if self._dashboard_runner is not None:
+            await self._dashboard_runner.cleanup()
+            self._dashboard_runner = None
+        await super().close()
+
+    async def _sync_guild(self, guild: discord.Guild) -> None:
+        if guild.id in self._synced_guilds:
+            return
         try:
-            return await ask_openrouter(key, question)
-        except Exception as e:  # noqa: BLE001 — фолбэк, ловим всё
-            print(f"⚠️ OPEN_ROUTER не сработал: {type(e).__name__}: {e}")
-    return await ask_pollinations(question)  # последний шанс — бесплатный сервис
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        except discord.HTTPException as error:
+            log.warning(
+                "Синхронизация команд сервера %s: HTTP %s", guild.id, error.status
+            )
+        else:
+            self._synced_guilds.add(guild.id)
+
+    async def on_ready(self) -> None:
+        for guild in self.guilds:
+            await self._sync_guild(guild)
+        log.info("Бот готов: %s", self.user)
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        await self._sync_guild(guild)
+
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        self._synced_guilds.discard(guild.id)
 
 
-# ---------- события ----------
-
-@bot.event
-async def on_ready():
-    # регистрация slash-команд на каждом сервере — работает мгновенно
-    for guild in bot.guilds:
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-    print(f"✅ Бот запущен: {bot.user} (id={bot.user.id})")
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    """Упомянули с текстом — отвечает нейронка; пустой пинг — посылает."""
-    if message.author == bot.user:
-        return
-    if bot.user and bot.user.mentioned_in(message):
-        text = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
-        if text:  # задали вопрос — отвечает нейронка
-            async with message.channel.typing():
-                try:
-                    await message.reply((await ask_ai(text))[:2000])
-                except Exception as e:  # noqa: BLE001
-                    print(f"⚠️ Ошибка нейронки: {type(e).__name__}: {e}")
-                    await message.reply("⚠️ Нейронка сейчас недоступна, попробуй позже.")
-        else:  # просто пинг — посылает
-            await message.reply("Пошёл нахуй")
-        return
-    # префиксных команд нет — process_commands не нужен
-
-
-# ---------- slash-команды ----------
-
-@bot.tree.command(name="ping", description="Проверить задержку бота")
-async def slash_ping(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Pong! {round(bot.latency * 1000)} мс")
-
-
-@bot.tree.command(name="hello", description="Поприветствовать бота")
-async def slash_hello(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Привет, {interaction.user.mention}!")
-
-
-@bot.tree.command(name="roll", description="Кинуть кубик")
-@app_commands.describe(грани="Сколько граней у кубика (по умолчанию 6)")
-async def slash_roll(interaction: discord.Interaction, грани: app_commands.Range[int, 2, 1000] = 6):
-    await interaction.response.send_message(
-        f"🎲 {interaction.user.mention} выбросил(а) **{random.randint(1, грани)}** (d{грани})"
-    )
-
-
-@bot.tree.command(name="coin", description="Подбросить монетку")
-async def slash_coin(interaction: discord.Interaction):
-    await interaction.response.send_message(f"🪙 {random.choice(['Орёл!', 'Решка!'])}")
-
-
-@bot.tree.command(name="choose", description="Случайно выбрать из вариантов")
-@app_commands.describe(варианты="Варианты через запятую: крипер, зомби, скелет")
-async def slash_choose(interaction: discord.Interaction, варианты: str):
-    options = [o.strip() for o in варианты.split(",") if o.strip()]
-    if len(options) < 2:
-        await interaction.response.send_message("Нужно минимум 2 варианта через запятую!", ephemeral=True)
-        return
-    await interaction.response.send_message(f"Я выбираю: **{random.choice(options)}**")
-
-
-@bot.tree.command(name="server", description="Статус майнкрафт-сервера")
-async def slash_server(interaction: discord.Interaction):
-    address = os.getenv("MC_SERVER", "localhost:25565")
-    await interaction.response.defer()
-    try:
-        server = await JavaServer.async_lookup(address)
-        status = await server.async_status()
-        players = status.players
-        embed = discord.Embed(title=f"🟢 {address}", color=0x55FF55)
-        embed.add_field(name="Игроки", value=f"{players.online}/{players.max}")
-        embed.add_field(name="Версия", value=status.version.name)
-        embed.add_field(name="Задержка", value=f"{round(status.latency)} мс")
-        if players.sample:
-            embed.add_field(name="Онлайн", value=", ".join(p.name for p in players.sample), inline=False)
-        await interaction.followup.send(embed=embed)
-    except Exception:  # noqa: BLE001 — mcstatus кидает разные типы ошибок
-        await interaction.followup.send(f"🔴 Сервер `{address}` офлайн или недоступен.")
-
-
-@bot.tree.command(name="ai", description="Спросить нейронку")
-@app_commands.describe(вопрос="Любой вопрос, например: что такое редстоун?")
-async def slash_ai(interaction: discord.Interaction, вопрос: str):
-    await interaction.response.defer()
-    try:
-        await interaction.followup.send((await ask_ai(вопрос))[:2000])
-    except Exception as e:  # noqa: BLE001
-        print(f"⚠️ Ошибка нейронки: {type(e).__name__}: {e}")
-        await interaction.followup.send("⚠️ Нейронка сейчас недоступна, попробуй позже.")
-
-
-token = os.getenv("DISCORD_TOKEN")
-if not token:
-    raise SystemExit("Задай токен: скопируй .env.example в .env и вставь DISCORD_TOKEN")
-
-bot.run(token)
-
-
-from aiohttp import web
-
-async def handle_healthcheck(request):
-    return web.Response(text="Бот работает!")
-
-async def main():
-    token = os.getenv("DISCORD_TOKEN")
+async def main() -> None:
+    load_dotenv()
+    token = os.getenv("DISCORD_TOKEN", "").strip()
     if not token:
-        raise SystemExit("Задай токен DISCORD_TOKEN в переменных окружения!")
+        raise ValueError("Задай DISCORD_TOKEN в .env или окружении")
 
-    # Запускаем мини-сервер для хостинга (чтобы Render видел, что порт открыт)
-    app_web = web.Application()
-    app_web.router.add_get("/", handle_healthcheck)
-    runner = web.AppRunner(app_web)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"🌐 Веб-сервер для пинга запущен на порту {port}")
+    bot: DiscordBot | None = None
+    runner: web.AppRunner | None = None
 
-    # Запускаем самого Discord-бота
-    async with bot:
-        await bot.start(token)
+    async def healthcheck(request: web.Request) -> web.Response:
+        ready = bot is not None and bot.is_ready() and not bot.is_closed()
+        return web.Response(
+            text="Бот готов" if ready else "Бот подключается",
+            status=200 if ready else 503,
+        )
+
+    try:
+        if port_value := os.getenv("PORT"):
+            port = int(port_value)
+            if not 1 <= port <= 65535:
+                raise ValueError("PORT должен быть в диапазоне 1–65535")
+            app = web.Application()
+            app.router.add_get("/", healthcheck)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            await web.TCPSite(runner, "0.0.0.0", port).start()
+            log.info("HTTP-проверка готовности запущена на порту %s", port)
+
+        for attempt in range(CONNECT_ATTEMPTS):
+            try:
+                # После сбоя нужен новый клиент с новыми сессиями и задачами.
+                async with DiscordBot() as bot:
+                    await bot.start(token)
+                return
+            except (
+                aiohttp.ClientError,
+                OSError,
+                discord.GatewayNotFound,
+                discord.ConnectionClosed,
+                discord.HTTPException,
+            ) as error:
+                if (
+                    isinstance(error, discord.HTTPException)
+                    and error.status < 500
+                    and error.status != 429
+                ):
+                    raise
+                if attempt == CONNECT_ATTEMPTS - 1:
+                    raise
+                delay = min(5 * 2**attempt, 60)
+                log.warning(
+                    "Подключение: %s; повтор через %s сек.", type(error).__name__, delay
+                )
+                await asyncio.sleep(delay)
+    finally:
+        if runner is not None:
+            await runner.cleanup()
+
+
+def run() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Бот остановлен")
+    except discord.LoginFailure:
+        raise SystemExit("Неверный DISCORD_TOKEN") from None
+    except discord.PrivilegedIntentsRequired:
+        raise SystemExit(
+            "Включи Message Content Intent и Server Members Intent в Developer Portal"
+        ) from None
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
+    except Exception as error:  # noqa: BLE001 — граница приложения, без утечки деталей запроса
+        log.error("Запуск завершился ошибкой: %s", type(error).__name__)
+        raise SystemExit(1) from None
+
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    run()
