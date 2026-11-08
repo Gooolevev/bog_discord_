@@ -153,7 +153,7 @@ export function SpotifyPlayer({ initialUrl = "" }: { initialUrl?: string }) {
         <>
           <div className="record-stage">
             <Image
-              src="/orbit-art.svg"
+              src={`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/orbit-art.svg`}
               width={240}
               height={240}
               className="record-cover"

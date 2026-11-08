@@ -17,7 +17,7 @@ export const metadata: Metadata = {
   },
   description: site.description,
   applicationName: site.name,
-  icons: { icon: "/icon.svg" },
+  icons: { icon: `${process.env.NEXT_PUBLIC_BASE_PATH || ""}/icon.svg` },
   openGraph: {
     title: "Discord Bot — ваш сервер, только ближе",
     description: site.description,

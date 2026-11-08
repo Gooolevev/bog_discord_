@@ -1,10 +1,14 @@
 import type { NextConfig } from "next";
+const staticSite = process.env.STATIC_SITE === "1";
 const config: NextConfig = {
+  ...(staticSite ? { output: "export", trailingSlash: true } : {}),
+  basePath: process.env.NEXT_PUBLIC_BASE_PATH || "",
   poweredByHeader: false,
   images: {
+    unoptimized: staticSite,
     remotePatterns: [{ protocol: "https", hostname: "cdn.discordapp.com" }],
   },
-  async headers() {
+  headers: staticSite ? undefined : async () => {
     return [
       {
         source: "/(.*)",

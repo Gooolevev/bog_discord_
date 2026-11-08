@@ -5,11 +5,13 @@
   "scripts": {
     "dev": "next dev --hostname 127.0.0.1",
     "build": "next build",
+    "build:pages": "node scripts/build-pages.mjs",
     "start": "next start --hostname 127.0.0.1",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
-    "test:http": "node tests/http-smoke.mjs"
+    "test:http": "node tests/http-smoke.mjs",
+    "test:pages": "node tests/pages-smoke.mjs"
   },
   "dependencies": {
     "class-variance-authority": "0.7.1",

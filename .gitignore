@@ -8,6 +8,7 @@ __pycache__/
 .zed/
 node_modules/
 .next/
+website/out/
 website/.env*
 !website/.env.example
 *.tsbuildinfo
