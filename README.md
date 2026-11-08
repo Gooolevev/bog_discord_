@@ -2,7 +2,7 @@
 
 # 🎮 Discord Minecraft Community Bot
 
-**Многофункциональный асинхронный Discord-бот для игровых сообществ с веб-панелью управления, мониторингом серверов Minecraft и интерактивными механиками.**
+**слабофункицональный асинхронный Discord-бот для игровых сообществ с веб-панелью управления, мониторингом серверов Minecraft и интерактивными механиками.**
 
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![discord.py](https://img.shields.io/badge/discord.py-v2.x-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://github.com/Rapptz/discord.py)
